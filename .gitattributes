@@ -1,0 +1,4 @@
+# Keep the repo LF-only; this is a Unix/RISC-V project built under Linux.
+* text=auto eol=lf
+*.png binary
+*.img binary
