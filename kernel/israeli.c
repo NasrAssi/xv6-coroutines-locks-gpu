@@ -30,6 +30,56 @@ void israeli_init(void) {
   }
 }
 
+// Remove the queue entry at index idx, shifting the remaining waiters down.
+// Caller must hold il->lk.
+static void
+il_remove_at(struct israeli_lock *il, int idx) {
+  for(int j = idx; j < il->count - 1; j++) il->queue[j] = il->queue[j+1];
+  il->count--;
+}
+
+// Remove proc p from the wait queue if present.  Returns 1 if it was found.
+// Caller must hold il->lk.
+static int
+il_dequeue(struct israeli_lock *il, struct proc *p) {
+  for(int i = 0; i < il->count; i++) {
+    if(il->queue[i] == p) {
+      il_remove_at(il, i);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Hand the currently-held lock to the next waiter (honoring favoritism), or
+// mark it free if no one is waiting.  Caller must hold il->lk with the lock
+// held (il->locked == 1); il->holder_gid identifies the releasing team.
+static void
+il_handoff(struct israeli_lock *il) {
+  if(il->count == 0) {
+    il->locked = 0;
+    il->holder_gid = -1;
+    return;
+  }
+
+  // FIFO by default, but with probability `favoritism` percent give the baton
+  // to the first waiter from the releasing holder's team.
+  int chosen = 0;
+  if(il->favoritism > 0 && (lcg_rand() % 100) < il->favoritism) {
+    for(int i = 0; i < il->count; i++) {
+      if(il->queue[i]->gid == il->holder_gid) {
+        chosen = i;
+        break;
+      }
+    }
+  }
+
+  struct proc *next = il->queue[chosen];
+  il_remove_at(il, chosen);
+  il->holder_gid = next->gid;
+  wakeup(next);
+}
+
 int israeli_create(int favoritism) {
   if(favoritism < 0 || favoritism > 100) return -1;
   for(int i = 0; i < MAX_ISRAELI_LOCKS; i++) {
@@ -77,26 +127,41 @@ int israeli_acquire(int lock_id) {
 
   while(1) {
     sleep(p, &il->lk);
-    
-    // Handle destroyed lock or killed process
-    if(!il->active || killed(p)) {
-      for(int i = 0; i < il->count; i++) {
-        if(il->queue[i] == p) {
-          for(int j = i; j < il->count - 1; j++) il->queue[j] = il->queue[j+1];
-          il->count--;
-          break;
-        }
-      }
+
+    // The lock was destroyed out from under us.  Nothing to release: even if
+    // we had just been granted it, the lock no longer exists.
+    if(!il->active) {
+      il_dequeue(il, p);
       release(&il->lk);
       return -1;
     }
 
-    // Check if we are still in the queue
+    // We are granted the lock once israeli_release() has removed us from the
+    // queue (it leaves locked==1 and holder_gid set).
     int queued = 0;
     for(int i = 0; i < il->count; i++) {
-      if(il->queue[i] == p) queued = 1;
+      if(il->queue[i] == p) { queued = 1; break; }
     }
-    if(!queued) break; // We own the lock
+
+    if(!queued) {
+      if(killed(p)) {
+        // We were handed the lock but we are dying.  Pass it on instead of
+        // leaking it -- otherwise locked stays 1 with no holder and every
+        // other waiter blocks forever.
+        il_handoff(il);
+        release(&il->lk);
+        return -1;
+      }
+      break; // We own the lock.
+    }
+
+    // Still queued: give up if killed, otherwise it was a spurious wakeup so
+    // go back to sleep.
+    if(killed(p)) {
+      il_dequeue(il, p);
+      release(&il->lk);
+      return -1;
+    }
   }
 
   release(&il->lk);
@@ -113,30 +178,7 @@ int israeli_release(int lock_id) {
     return -1;
   }
 
-  if(il->count == 0) {
-    il->locked = 0;
-    il->holder_gid = -1;
-    release(&il->lk);
-    return 0;
-  }
-
-  // Apply favoritism logic
-  int chosen = 0;
-  if(il->favoritism > 0 && (lcg_rand() % 100) < il->favoritism) {
-    for(int i = 0; i < il->count; i++) {
-      if(il->queue[i]->gid == il->holder_gid) {
-        chosen = i;
-        break;
-      }
-    }
-  }
-
-  struct proc *next = il->queue[chosen];
-  for(int i = chosen; i < il->count - 1; i++) il->queue[i] = il->queue[i+1];
-  il->count--;
-
-  il->holder_gid = next->gid;
-  wakeup(next);
+  il_handoff(il);
   release(&il->lk);
   return 0;
 }

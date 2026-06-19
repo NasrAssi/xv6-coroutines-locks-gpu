@@ -647,22 +647,40 @@ co_yield(int target_pid, int val)
 
   struct proc *target = 0;
   for(struct proc *p = proc; p < &proc[NPROC]; p++){
-    if(p == me) continue;
+    if(p == me)
+      continue;
     acquire(&p->lock);
-    if(p->state != UNUSED && p->pid == target_pid){
+    // pid is fixed for a proc's lifetime; record a match and re-validate below.
+    int match = (p->state != UNUSED && p->pid == target_pid);
+    release(&p->lock);
+    if(match){
       target = p;
       break;
     }
-    release(&p->lock);
   }
   if(target == 0)
     return -1;
-  if(target->killed || target->state == ZOMBIE){
-    release(&target->lock);
-    return -1;
+
+  // Acquire me->lock and target->lock in a fixed, address-based order.  Taking
+  // them in arrival order (target then me) deadlocks when two processes
+  // co_yield to each other on different CPUs: each grabs one lock and spins
+  // forever for the other.
+  if(me < target){
+    acquire(&me->lock);
+    acquire(&target->lock);
+  } else {
+    acquire(&target->lock);
+    acquire(&me->lock);
   }
 
-  acquire(&me->lock);
+  // Re-validate now that both locks are held: the target may have exited or
+  // been reused after we dropped its lock during the scan.
+  if(target->state == UNUSED || target->pid != target_pid ||
+     target->killed || target->state == ZOMBIE){
+    release(&target->lock);
+    release(&me->lock);
+    return -1;
+  }
 
   int direct = (target->state == SLEEPING &&
                 target->chan == (void*)co_yield);

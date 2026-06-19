@@ -72,3 +72,9 @@
 
 // GPU framebuffer size (640x480x4 bytes = 300 pages)
 #define GPU_FB_PAGES 300
+
+// Fixed user-virtual-address window for the framebuffer mapping installed by
+// map_display().  Placed directly below the trapframe, well clear of the heap,
+// so that growing the heap with sbrk() can never collide with it (a collision
+// would panic mappages() on remap).
+#define GPU_FB_BASE (TRAPFRAME - (uint64)GPU_FB_PAGES * PGSIZE)

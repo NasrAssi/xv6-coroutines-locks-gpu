@@ -238,8 +238,9 @@ sys_map_display(void)
 
   uint64 va;
   if(addr == 0){
-    // Auto-select: the first page-aligned VA above the process's heap.
-    va = PGROUNDUP(p->sz);
+    // Auto-select the fixed framebuffer window below the trapframe.  It sits
+    // far above the heap, so a later sbrk() can never grow into it.
+    va = GPU_FB_BASE;
   } else {
     // Caller-supplied VA must be page-aligned.
     if((addr % PGSIZE) != 0)
@@ -247,9 +248,11 @@ sys_map_display(void)
     va = addr;
   }
 
-  // The whole framebuffer region must fit below the trapframe/trampoline.
+  // The framebuffer region must fit below the trapframe/trampoline and must
+  // not overlap the current heap -- otherwise a later sbrk() could try to
+  // remap these pages and panic the kernel.
   uint64 size = (uint64)GPU_FB_PAGES * PGSIZE;
-  if(va >= TRAPFRAME || va + size > TRAPFRAME)
+  if(va < p->sz || va >= TRAPFRAME || va + size > TRAPFRAME)
     return -1;
 
   // Only one framebuffer mapping per process; drop a previous one first so
