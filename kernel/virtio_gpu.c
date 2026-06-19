@@ -130,9 +130,14 @@ struct virtio_gpu_resource_detach_backing
 
 #define GPU_NUM 8
 
-// Serialises all virtqueue operations so the daemon and user syscalls
-// can coexist on multi-CPU systems.
+// gpu_lock serialises low-level virtqueue access inside gpu_send().
+// gpu_oplock serialises whole multi-command operations (flip, commit,
+// release) together with the shared command/backing buffers they build, so a
+// flip's detach+attach pair cannot interleave with the daemon's commit or
+// another flip.  Lock order: acquire gpu_oplock before gpu_lock, never the
+// reverse.
 static struct spinlock gpu_lock;
+static struct spinlock gpu_oplock;
 
 static struct
 {
@@ -422,6 +427,7 @@ void virtio_gpu_init(void)
 {
     uint32 status = 0;
     initlock(&gpu_lock, "vgpu");
+    initlock(&gpu_oplock, "vgpuop");
 
     // ── 1. VirtIO device handshake ──────────────────────────────────────
     if (*R1(VIRTIO_MMIO_MAGIC_VALUE) != 0x74726976 ||
@@ -545,7 +551,9 @@ void virtio_gpu_init(void)
 // Called by display_daemon.  Sends TRANSFER_TO_HOST_2D + RESOURCE_FLUSH.
 void virtio_gpu_commit(void)
 {
+    acquire(&gpu_oplock);
     gpu_transfer_flush();
+    release(&gpu_oplock);
 }
 
 // ── map_display support ───────────────────────────────────────────────
@@ -594,6 +602,11 @@ virtio_gpu_flip(uint64 *pas, int n, int pid)
         return -1;
 
     static struct virtio_gpu_mem_entry entries[FB_PAGES];
+
+    // Hold gpu_oplock across the whole detach+attach+record so the device is
+    // never seen with a half-installed backing, and so entries[]/flip_pas[]/
+    // flip_owner_pid are not raced by a concurrent flip or release.
+    acquire(&gpu_oplock);
     for (int i = 0; i < n; i++) {
         entries[i].addr = pas[i];
         entries[i].length = PGSIZE;
@@ -603,11 +616,10 @@ virtio_gpu_flip(uint64 *pas, int n, int pid)
     gpu_cmd_detach();
     gpu_cmd_attach(entries, n);
 
-    acquire(&gpu_lock);
     for (int i = 0; i < n; i++)
         flip_pas[i] = pas[i];
     flip_owner_pid = pid;
-    release(&gpu_lock);
+    release(&gpu_oplock);
     return 0;
 }
 
@@ -619,24 +631,22 @@ virtio_gpu_flip(uint64 *pas, int n, int pid)
 void
 virtio_gpu_release(int pid)
 {
-    acquire(&gpu_lock);
-    int owned = (flip_owner_pid == pid);
-    release(&gpu_lock);
-    if (!owned)
-        return;
+    // Serialise the whole check-copy-reattach against flips and commits: the
+    // owner test, the final-frame copy, and the kernel-fb re-attach must be one
+    // atomic operation, or a concurrent flip could be clobbered (or the device
+    // left pointing at the freed pages).
+    acquire(&gpu_oplock);
+    if (flip_owner_pid == pid) {
+        // Preserve the final frame: the flipped pages are still valid here
+        // (the process's memory has not been freed yet), and kernel memory is
+        // direct-mapped, so flip_pas[i] doubles as a kernel pointer.
+        for (int i = 0; i < FB_PAGES; i++)
+            memmove(fb[i], (void *)flip_pas[i], PGSIZE);
 
-    // Preserve the final frame: the flipped pages are still valid here
-    // (the process's memory has not been freed yet), and kernel memory is
-    // direct-mapped, so flip_pas[i] doubles as a kernel pointer.
-    for (int i = 0; i < FB_PAGES; i++)
-        memmove(fb[i], (void *)flip_pas[i], PGSIZE);
-
-    gpu_attach_kernel_fb();
-
-    acquire(&gpu_lock);
-    if (flip_owner_pid == pid)
+        gpu_attach_kernel_fb();
         flip_owner_pid = -1;
-    release(&gpu_lock);
+    }
+    release(&gpu_oplock);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────
