@@ -107,4 +107,6 @@ struct proc {
   int gid;                     // Group identifier (Israeli lock)
   uint64 fbva;                 // VA where GPU framebuffer is mapped, 0 if none
   int fb_flipped;              // non-zero if this proc owns the GPU flip backing
+  struct proc *co_target;      // co_yield: proc we are parked waiting to resume us
+  int co_failed;               // co_yield: set when co_target died -> return -1
 };
