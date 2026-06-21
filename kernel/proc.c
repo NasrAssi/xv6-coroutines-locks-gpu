@@ -130,6 +130,10 @@ found:
   p->fbva = 0;
   p->fb_flipped = 0;
 
+  // No coroutine rendezvous in progress.
+  p->co_target = 0;
+  p->co_failed = 0;
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
