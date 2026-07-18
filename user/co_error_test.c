@@ -44,6 +44,26 @@ test_zombie_target(void)
 }
 
 static void
+test_partner_exits(void)
+{
+  int pid = fork();
+  if(pid < 0){
+    printf("FAIL: F: fork failed\n");
+    fails++;
+    return;
+  }
+  if(pid == 0){
+    // Give the parent time to park in co_yield, then exit without
+    // ever yielding back.
+    sleep(5);
+    exit(0);
+  }
+  int r = co_yield(pid, 1);
+  expect("F: partner exited while we were parked", r, -1);
+  wait(0);
+}
+
+static void
 test_self_yield(void)
 {
   int r = co_yield(getpid(), 1);
@@ -71,6 +91,7 @@ main(int argc, char *argv[])
 
   test_nonexistent_pid();
   test_zombie_target();
+  test_partner_exits();
   test_self_yield();
   test_pid_zero();
   test_negative_pid();
