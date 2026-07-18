@@ -193,6 +193,8 @@ freeproc(struct proc *p)
   p->name[0] = 0;
   p->chan = 0;
   p->killed = 0;
+  p->co_target = 0;
+  p->co_failed = 0;
   p->xstate = 0;
   p->state = UNUSED;
 }
@@ -414,7 +416,27 @@ exit(int status)
 
   // Parent might be sleeping in wait().
   wakeup(p->parent);
-  
+
+  // A coroutine parked in co_yield waiting on us sleeps on the co_yield
+  // channel, so the parent wakeup above never reaches it.  Mark ourselves
+  // killed first so a co_yield that validates us from here on returns -1
+  // instead of parking (its re-validation checks target->killed); a proc
+  // that validated earlier holds its own lock until it is fully parked,
+  // so the scan below cannot miss it.  Fail and wake every parked partner.
+  setkilled(p);
+  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp == p)
+      continue;
+    acquire(&pp->lock);
+    if(pp->state == SLEEPING && pp->chan == (void*)co_yield &&
+       pp->co_target == p){
+      pp->co_failed = 1;
+      pp->chan = 0;
+      pp->state = RUNNABLE;
+    }
+    release(&pp->lock);
+  }
+
   acquire(&p->lock);
 
   p->xstate = status;
@@ -696,6 +718,7 @@ co_yield(int target_pid, int val)
 
     me->state = SLEEPING;
     me->chan = (void*)co_yield;
+    me->co_target = target;
 
     int intena = mycpu()->intena;
     swtch(&me->context, &target->context);
@@ -704,6 +727,7 @@ co_yield(int target_pid, int val)
     release(&target->lock);
     me->state = SLEEPING;
     me->chan = (void*)co_yield;
+    me->co_target = target;
     sched();
   }
 
@@ -715,7 +739,10 @@ co_yield(int target_pid, int val)
     release(&waker->lock);
   }
 
-  if(me->killed){
+  me->co_target = 0;
+
+  if(me->killed || me->co_failed){
+    me->co_failed = 0;
     me->chan = 0;
     release(&me->lock);
     return -1;
